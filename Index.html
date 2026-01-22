@@ -1,0 +1,390 @@
+import React, { useState, useEffect, useMemo } from 'react';
+import { initializeApp } from 'firebase/app';
+import { 
+  getAuth, 
+  signInAnonymously, 
+  signInWithCustomToken,
+  onAuthStateChanged 
+} from 'firebase/auth';
+import { 
+  getFirestore, 
+  collection, 
+  addDoc, 
+  query, 
+  onSnapshot, 
+  orderBy, 
+  serverTimestamp, 
+  updateDoc, 
+  doc, 
+  deleteDoc 
+} from 'firebase/firestore';
+import { 
+  User, 
+  MapPin, 
+  Plus, 
+  CheckCircle, 
+  XCircle, 
+  HelpCircle, 
+  Home, 
+  Filter,
+  Trash2,
+  BarChart3,
+  List,
+  Search
+} from 'lucide-react';
+
+// --- Firebase Configuration ---
+// ここでデータベース(Firebase)への接続設定を行っています
+const firebaseConfig = JSON.parse(__firebase_config);
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+// --- Constants ---
+// ランクごとの色やアイコンの設定です
+// ここを変えれば「Dランク」を追加したり色を変えたりできます
+const RANKS = {
+  A: { label: 'A: 確実 (支持)', color: 'bg-red-500', text: 'text-red-600', icon: CheckCircle },
+  B: { label: 'B: 脈あり', color: 'bg-orange-400', text: 'text-orange-500', icon: HelpCircle },
+  C: { label: 'C: 厳しい', color: 'bg-gray-400', text: 'text-gray-500', icon: XCircle },
+  ABSENT: { label: '留守', color: 'bg-blue-400', text: 'text-blue-500', icon: Home },
+};
+
+// --- Components ---
+
+// 1. Loading Screen
+// データの読み込み中に表示されるグルグルマークです
+const LoadingScreen = () => (
+  <div className="flex items-center justify-center h-screen bg-gray-50">
+    <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-red-600"></div>
+  </div>
+);
+
+// 2. Rank Selector Component
+// 入力画面でランクを選ぶ大きなボタンの部品です
+const RankButton = ({ rankKey, selected, onClick }) => {
+  const config = RANKS[rankKey];
+  const Icon = config.icon;
+  
+  return (
+    <button
+      type="button"
+      onClick={() => onClick(rankKey)}
+      className={`
+        relative w-full p-4 rounded-xl border-2 transition-all duration-200 flex flex-col items-center justify-center gap-2
+        ${selected 
+          ? `border-${config.color.replace('bg-', '')} bg-white shadow-md ring-2 ring-offset-1 ring-${config.color.replace('bg-', '')}` 
+          : 'border-gray-200 bg-gray-50 hover:bg-white'}
+      `}
+    >
+      <Icon className={`w-8 h-8 ${config.text}`} />
+      <span className={`text-sm font-bold ${selected ? 'text-gray-900' : 'text-gray-500'}`}>
+        {config.label.split(':')[0]}
+      </span>
+      {selected && (
+        <div className={`absolute top-2 right-2 w-3 h-3 rounded-full ${config.color}`} />
+      )}
+    </button>
+  );
+};
+
+// 3. Main App Component
+// アプリ全体の動きを管理するメイン部分です
+export default function App() {
+  const [user, setUser] = useState(null);
+  const [visits, setVisits] = useState([]); // 訪問データのリスト
+  const [loading, setLoading] = useState(true);
+  const [view, setView] = useState('list'); // 現在の画面（一覧 or 追加）
+  const [filterRank, setFilterRank] = useState('ALL'); // 絞り込み状態
+  const [searchTerm, setSearchTerm] = useState(''); // 検索キーワード
+  
+  // 入力フォームの一時的なデータ
+  const [formData, setFormData] = useState({
+    name: '',
+    address: '',
+    rank: 'B',
+    note: ''
+  });
+
+  // --- Auth & Data Fetching ---
+  // アプリ起動時にログイン処理とデータの取得を行います
+  useEffect(() => {
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (error) {
+        console.error("Auth failed:", error);
+      }
+    };
+    initAuth();
+
+    const unsubscribeAuth = onAuthStateChanged(auth, (currentUser) => {
+      setUser(currentUser);
+      if (!currentUser) setLoading(false);
+    });
+    return () => unsubscribeAuth();
+  }, []);
+
+  // ユーザーがログインしたら、その人のデータを監視します
+  useEffect(() => {
+    if (!user) return;
+
+    const q = query(
+      collection(db, 'artifacts', appId, 'users', user.uid, 'visits')
+    );
+
+    const unsubscribeDocs = onSnapshot(q, (snapshot) => {
+      const data = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data(),
+        createdAt: doc.data().createdAt?.toDate() || new Date()
+      }));
+      // 日付が新しい順に並び替え
+      data.sort((a, b) => b.createdAt - a.createdAt);
+      setVisits(data);
+      setLoading(false);
+    }, (error) => {
+      console.error("Data fetch error:", error);
+      setLoading(false);
+    });
+
+    return () => unsubscribeDocs();
+  }, [user]);
+
+  // --- Handlers ---
+  // 保存ボタンが押された時の処理
+  const handleAddVisit = async (e) => {
+    e.preventDefault();
+    if (!user || !formData.address) return; // 住所は必須
+
+    try {
+      // データベースに新しい記録を追加
+      await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'visits'), {
+        ...formData,
+        createdAt: serverTimestamp()
+      });
+      // フォームをリセットして一覧画面に戻る
+      setFormData({ name: '', address: '', rank: 'B', note: '' }); 
+      setView('list');
+    } catch (error) {
+      console.error("Error adding document: ", error);
+      alert("保存に失敗しました。");
+    }
+  };
+
+  // 削除ボタンが押された時の処理
+  const handleDelete = async (id) => {
+    if(!confirm("この記録を削除しますか？")) return;
+    try {
+      await deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'visits', id));
+    } catch(err) {
+      console.error(err);
+    }
+  };
+
+  // --- Filtering ---
+  // 検索ワードやランクでの絞り込み処理
+  const filteredVisits = visits.filter(v => {
+    const matchesRank = filterRank === 'ALL' || v.rank === filterRank;
+    const matchesSearch = 
+      v.name.includes(searchTerm) || 
+      v.address.includes(searchTerm) || 
+      v.note.includes(searchTerm);
+    return matchesRank && matchesSearch;
+  });
+
+  if (loading) return <LoadingScreen />;
+
+  // --- View: Add New Visit ---
+  // 追加画面（フォーム）の見た目
+  if (view === 'add') {
+    return (
+      <div className="min-h-screen bg-gray-50 flex flex-col">
+        {/* ヘッダー部分 */}
+        <div className="bg-white px-4 py-4 shadow-sm border-b sticky top-0 z-10 flex items-center justify-between">
+          <button onClick={() => setView('list')} className="text-gray-500">キャンセル</button>
+          <h1 className="text-lg font-bold text-gray-800">訪問記録を追加</h1>
+          <button 
+            onClick={handleAddVisit} 
+            className="text-red-600 font-bold disabled:opacity-50"
+            disabled={!formData.address}
+          >
+            保存
+          </button>
+        </div>
+
+        <div className="p-4 space-y-6 max-w-lg mx-auto w-full flex-1">
+          {/* ランク選択ボタン */}
+          <section>
+            <label className="block text-sm font-medium text-gray-700 mb-2">反応 (ランク)</label>
+            <div className="grid grid-cols-2 gap-3">
+              {Object.keys(RANKS).map(key => (
+                <RankButton 
+                  key={key} 
+                  rankKey={key} 
+                  selected={formData.rank === key} 
+                  onClick={(r) => setFormData({...formData, rank: r})} 
+                />
+              ))}
+            </div>
+          </section>
+
+          {/* テキスト入力エリア */}
+          <section className="space-y-4">
+             <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">住所 (必須)</label>
+              <div className="relative">
+                <MapPin className="absolute left-3 top-3 text-gray-400 w-5 h-5" />
+                <input
+                  type="text"
+                  placeholder="例: 〇〇町 1-2-3"
+                  className="w-full pl-10 p-3 rounded-lg border border-gray-300 focus:ring-2 focus:ring-red-500 focus:border-transparent"
+                  value={formData.address}
+                  onChange={e => setFormData({...formData, address: e.target.value})}
+                  required
+                />
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">お名前 (表札など)</label>
+              <div className="relative">
+                <User className="absolute left-3 top-3 text-gray-400 w-5 h-5" />
+                <input
+                  type="text"
+                  placeholder="例: 山田 太郎"
+                  className="w-full pl-10 p-3 rounded-lg border border-gray-300 focus:ring-2 focus:ring-red-500 focus:border-transparent"
+                  value={formData.name}
+                  onChange={e => setFormData({...formData, name: e.target.value})}
+                />
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">メモ</label>
+              <textarea
+                placeholder="要望や会話の内容..."
+                className="w-full p-3 rounded-lg border border-gray-300 focus:ring-2 focus:ring-red-500 focus:border-transparent h-24"
+                value={formData.note}
+                onChange={e => setFormData({...formData, note: e.target.value})}
+              />
+            </div>
+          </section>
+        </div>
+      </div>
+    );
+  }
+
+  // --- View: List & Dashboard ---
+  // 一覧画面の見た目
+  return (
+    <div className="min-h-screen bg-gray-100 flex flex-col max-w-md mx-auto shadow-2xl overflow-hidden">
+      
+      {/* トップヘッダー */}
+      <header className="bg-red-700 text-white p-4 shadow-md z-10">
+        <div className="flex justify-between items-center mb-4">
+          <h1 className="text-xl font-bold flex items-center gap-2">
+            <MapPin className="w-5 h-5" />
+            個別訪問管理
+          </h1>
+          <div className="text-xs bg-red-800 px-2 py-1 rounded">
+             {visits.length}件 訪問済
+          </div>
+        </div>
+
+        {/* 検索バー */}
+        <div className="relative">
+          <Search className="absolute left-3 top-2.5 text-red-200 w-4 h-4" />
+          <input 
+            type="text" 
+            placeholder="名前や住所で検索..." 
+            className="w-full pl-9 pr-4 py-2 bg-red-800/50 text-white placeholder-red-200 rounded-lg focus:outline-none focus:bg-red-800 border border-transparent focus:border-red-400 text-sm"
+            value={searchTerm}
+            onChange={(e) => setSearchTerm(e.target.value)}
+          />
+        </div>
+      </header>
+
+      {/* 絞り込みタブ */}
+      <div className="bg-white border-b flex overflow-x-auto no-scrollbar">
+        <button 
+          onClick={() => setFilterRank('ALL')}
+          className={`px-4 py-3 text-sm font-medium whitespace-nowrap border-b-2 transition-colors ${filterRank === 'ALL' ? 'border-red-600 text-red-600' : 'border-transparent text-gray-500'}`}
+        >
+          すべて
+        </button>
+        {Object.keys(RANKS).map(key => (
+          <button 
+            key={key}
+            onClick={() => setFilterRank(key)}
+            className={`px-4 py-3 text-sm font-medium whitespace-nowrap border-b-2 transition-colors ${filterRank === key ? `border-${RANKS[key].color.replace('bg-', '')} text-gray-900` : 'border-transparent text-gray-500'}`}
+          >
+            {RANKS[key].label.split(':')[0]}
+          </button>
+        ))}
+      </div>
+
+      {/* リスト表示部分 */}
+      <div className="flex-1 overflow-y-auto p-4 space-y-3 pb-24">
+        {filteredVisits.length === 0 ? (
+          <div className="text-center py-10 text-gray-400">
+            <p>データがありません</p>
+            <p className="text-sm mt-2">右下の＋ボタンで記録を追加</p>
+          </div>
+        ) : (
+          filteredVisits.map(visit => {
+            const RankIcon = RANKS[visit.rank].icon;
+            return (
+              <div key={visit.id} className="bg-white p-4 rounded-xl shadow-sm border border-gray-100 active:scale-[0.99] transition-transform">
+                <div className="flex justify-between items-start mb-2">
+                  <div className="flex items-center gap-2">
+                    <span className={`px-2 py-1 rounded text-xs font-bold text-white ${RANKS[visit.rank].color}`}>
+                      {RANKS[visit.rank].label.split(' ')[0]}
+                    </span>
+                    <span className="text-xs text-gray-400">
+                      {visit.createdAt.toLocaleDateString()} {visit.createdAt.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}
+                    </span>
+                  </div>
+                  <button onClick={() => handleDelete(visit.id)} className="text-gray-300 hover:text-red-500">
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                </div>
+                
+                <h3 className="font-bold text-gray-900 text-lg mb-1">
+                  {visit.name || "（名称なし）"}
+                </h3>
+                
+                <div className="flex items-center text-gray-600 text-sm mb-2">
+                  <MapPin className="w-3 h-3 mr-1" />
+                  {visit.address}
+                </div>
+
+                {visit.note && (
+                  <div className="bg-gray-50 p-2 rounded text-sm text-gray-600 mt-2 border-l-2 border-gray-300">
+                    {visit.note}
+                  </div>
+                )}
+              </div>
+            );
+          })
+        )}
+      </div>
+
+      {/* フローティングアクションボタン（右下の＋） */}
+      <button 
+        onClick={() => setView('add')}
+        className="fixed bottom-6 right-6 w-14 h-14 bg-red-600 text-white rounded-full shadow-lg flex items-center justify-center hover:bg-red-700 active:scale-90 transition-all z-20"
+      >
+        <Plus className="w-8 h-8" />
+      </button>
+
+    </div>
+  );
+}
+
+
